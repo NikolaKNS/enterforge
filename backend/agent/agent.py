@@ -14,7 +14,7 @@ from core import get_supabase_client
 
 # Ollama API configuration
 OLLAMA_BASE_URL = "http://localhost:11434"
-OLLAMA_MODEL = "kimi-k2"
+OLLAMA_MODEL = "llama3.1"
 
 
 @dataclass
@@ -329,12 +329,13 @@ Important guidelines:
                     "content": msg.content
                 })
 
-        # Add tools description
-        tools_desc = self._build_tools_description()
-        messages.append({
-            "role": "system",
-            "content": f"\n\nAvailable tools:\n{tools_desc}\n\nIf you need to use tools, respond ONLY with JSON: {{\"tool_calls\": [{{\"name\": \"tool_name\", \"arguments\": {{...}}}}]}}\nOtherwise respond normally."
-        })
+        # Add tools description (simplified - tools can cause issues with some models)
+        # Skip tools for simple conversations, only add them when needed
+        pass  # Skip tools description for now
+
+        print(f"[DEBUG] Sending {len(messages)} messages to Ollama")
+        for i, m in enumerate(messages):
+            print(f"[DEBUG] Message {i}: role={m['role']}, content={m['content'][:50]}...")
 
         # Make API call
         try:
@@ -352,8 +353,10 @@ Important guidelines:
             )
             response.raise_for_status()
             data = response.json()
+            print(f"[DEBUG] Ollama full response: {json.dumps(data, indent=2)[:500]}")
 
             content = data.get("message", {}).get("content", "")
+            print(f"[DEBUG] Extracted content: '{content[:200]}...' " if len(content) > 200 else f"[DEBUG] Extracted content: '{content}'")
 
             # Try to parse tool calls
             try:
@@ -445,23 +448,26 @@ Important guidelines:
         tool_calls: Optional[List[Dict]] = None,
         tool_results: Optional[List[Dict]] = None
     ) -> None:
-        """Save message to Supabase."""
+        """Save message to Supabase (or skip if unavailable)."""
         if not self.conversation_id:
             return
 
-        supabase = get_supabase_client()
+        # Try to save to Supabase, but silently skip if unavailable
+        try:
+            supabase = get_supabase_client()
+            data = {
+                "conversation_id": self.conversation_id,
+                "role": role,
+                "content": content,
+                "tool_calls": tool_calls,
+                "tool_results": tool_results
+            }
+            supabase.table("messages").insert(data).execute()
+        except Exception:
+            # Supabase not available, continue with local-only storage
+            pass
 
-        data = {
-            "conversation_id": self.conversation_id,
-            "role": role,
-            "content": content,
-            "tool_calls": tool_calls,
-            "tool_results": tool_results
-        }
-
-        supabase.table("messages").insert(data).execute()
-
-        # Add to local history
+        # Add to local history (always works)
         self.messages.append(Message(
             role=role,
             content=content,

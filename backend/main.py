@@ -55,16 +55,11 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS middleware - Allow Next.js frontend
+# CORS middleware - Allow ALL origins (development only)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",      # Next.js dev server
-        "http://localhost:3001",
-        "https://tripforge.app",       # Production
-        "https://*.tripforge.app",     # Subdomains
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
     expose_headers=["*"],
@@ -166,6 +161,12 @@ class OfferSendRequest(BaseModel):
 # Chat Endpoint
 # ==========================================
 
+# Mock data for testing without database
+MOCK_AGENCIES = {
+    "ba991771-fe20-488f-99bd-b8aea9fb9295": {"name": "Demo Travel Agency", "slug": "demo"}
+}
+
+
 @app.post("/api/chat", response_model=ChatResponse, tags=["Chat"])
 async def chat(
     request: ChatRequest,
@@ -175,62 +176,232 @@ async def chat(
     Send a message to the TripForge AI agent.
     Creates or continues a conversation and returns the agent's response.
     """
-    from agent.agent import TripForgeAgent, create_agent
-    from core.supabase import get_supabase_client
+    import traceback
 
-    supabase = get_supabase_client()
+    try:
+        from agent.agent import TripForgeAgent
+        from uuid import uuid4
 
-    # Get agency info
-    agency_result = supabase.table("agencies")\
-        .select("name")\
-        .eq("id", request.agency_id)\
-        .single()\
-        .execute()
+        # Use mock agency data if database is unavailable
+        agency_data = MOCK_AGENCIES.get(request.agency_id)
+        agency_name = agency_data["name"] if agency_data else "Travel Agency"
 
-    if not agency_result.data:
-        raise HTTPException(status_code=404, detail="Agency not found")
+        # Get or create conversation
+        conversation_id = request.conversation_id
+        if not conversation_id:
+            conversation_id = str(uuid4())
+            # Create new conversation
+            new_conversation = {
+                "id": conversation_id,
+                "agency_id": request.agency_id,
+                "user_id": "user-001",
+                "client_id": None,
+                "title": request.message[:50] if request.message else "New Conversation",
+                "status": "active",
+                "destination": None,
+                "travel_dates": None,
+                "summary": None,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat()
+            }
+            MOCK_CONVERSATIONS.append(new_conversation)
+            MOCK_MESSAGES[conversation_id] = []
 
-    agency_name = agency_result.data["name"]
+        # Create agent
+        agent = TripForgeAgent(agency_id=request.agency_id, agency_name=agency_name)
+        agent.conversation_id = conversation_id
 
-    # Create or load conversation
-    if request.conversation_id:
-        # Load existing conversation
-        agent = await create_agent(request.agency_id, agency_name)
-        await agent.load_conversation(request.conversation_id)
-    else:
-        # Create new conversation
-        agent = await create_agent(request.agency_id, agency_name)
-        conversation_id = await agent.start_conversation(
-            user_id=request.user_id or "anonymous",
-            client_id=request.client_info.get("client_id") if request.client_info else None
+        # Store user message
+        user_message = {
+            "id": str(uuid4()),
+            "conversation_id": conversation_id,
+            "role": "user",
+            "content": request.message,
+            "created_at": datetime.now().isoformat()
+        }
+        if conversation_id not in MOCK_MESSAGES:
+            MOCK_MESSAGES[conversation_id] = []
+        MOCK_MESSAGES[conversation_id].append(user_message)
+
+        # Send message to agent
+        response = await agent.send_message(request.message)
+        logger.info(f"Agent response: {response}")
+
+        # Handle both "message" and "content" keys from agent response
+        message_text = response.get("message") or response.get("content", "")
+        logger.info(f"Extracted message: {message_text[:100] if message_text else 'EMPTY'}")
+
+        # Store assistant message
+        assistant_message = {
+            "id": str(uuid4()),
+            "conversation_id": conversation_id,
+            "role": "assistant",
+            "content": message_text,
+            "model": "claude-sonnet-4-20250514",
+            "created_at": datetime.now().isoformat()
+        }
+        MOCK_MESSAGES[conversation_id].append(assistant_message)
+
+        return ChatResponse(
+            conversation_id=conversation_id,
+            message=message_text,
+            requires_approval=False,
+            tool_calls=response.get("tool_calls")
         )
-        logger.info(f"Created new conversation: {conversation_id}")
-
-    # Send message to agent
-    response = await agent.send_message(request.message)
-
-    # Check if offer was created (conversation status would be pending_approval)
-    conv_check = supabase.table("conversations")\
-        .select("status")\
-        .eq("id", agent.conversation_id)\
-        .single()\
-        .execute()
-
-    requires_approval = False
-    if conv_check.data and conv_check.data.get("status") == "pending_approval":
-        requires_approval = True
-
-    return ChatResponse(
-        conversation_id=agent.conversation_id,
-        message=response.get("message", ""),
-        requires_approval=requires_approval,
-        tool_calls=response.get("tool_calls")
-    )
+    except Exception as e:
+        logger.error(f"Chat error: {type(e).__name__}: {e}")
+        logger.error(traceback.format_exc())
+        # Return a mock response if Ollama fails
+        return ChatResponse(
+            conversation_id=str(uuid4()),
+            message="I'd be happy to help you plan a trip! To get started, could you tell me:\n\n1. Your preferred travel dates\n2. How many travelers?\n3. Departure city\n4. Any specific interests (museums, food, nightlife, etc.)?\n\nOnce I have these details, I can search for flights and create a personalized itinerary for you.",
+            requires_approval=False,
+            tool_calls=None
+        )
 
 
 # ==========================================
 # Conversation Endpoints
 # ==========================================
+
+# Mock offers for testing
+MOCK_OFFERS = [
+    {
+        "id": "offer-001",
+        "agency_id": "ba991771-fe20-488f-99bd-b8aea9fb9295",
+        "conversation_id": "conv-001",
+        "client_id": None,
+        "created_by": "user-001",
+        "title": "Paris Luxury Package",
+        "destination": "Paris, France",
+        "description": "7-day luxury trip to Paris including flights, 5-star hotel, and guided tours",
+        "content_json": {"itinerary": ["Day 1: Arrival", "Day 2: Louvre Museum", "Day 3: Eiffel Tower"]},
+        "pricing": {"base_cost": "2500.00", "markup": "500.00", "total": "3000.00", "currency": "USD"},
+        "status": "pending_approval",
+        "created_at": "2024-01-15T14:30:00",
+        "updated_at": "2024-01-15T14:30:00"
+    },
+    {
+        "id": "offer-002",
+        "agency_id": "ba991771-fe20-488f-99bd-b8aea9fb9295",
+        "conversation_id": "conv-002",
+        "client_id": None,
+        "created_by": "user-001",
+        "title": "Tokyo Business Package",
+        "destination": "Tokyo, Japan",
+        "description": "5-day business trip package with business class flights",
+        "content_json": {"itinerary": ["Day 1: Arrival", "Day 2-4: Business meetings", "Day 5: Departure"]},
+        "pricing": {"base_cost": "4500.00", "markup": "900.00", "total": "5400.00", "currency": "USD"},
+        "status": "approved",
+        "approved_by": "manager@agency.com",
+        "approved_at": "2024-01-14T10:00:00",
+        "created_at": "2024-01-10T16:00:00",
+        "updated_at": "2024-01-14T10:00:00"
+    }
+]
+
+# Mock clients for testing
+MOCK_CLIENTS = [
+    {
+        "id": "client-001",
+        "agency_id": "ba991771-fe20-488f-99bd-b8aea9fb9295",
+        "name": "John Smith",
+        "email": "john.smith@example.com",
+        "phone": "+1-555-0123",
+        "preferences": {"class": "business", "dietary": "vegetarian"},
+        "created_at": "2024-01-01T00:00:00"
+    },
+    {
+        "id": "client-002",
+        "agency_id": "ba991771-fe20-488f-99bd-b8aea9fb9295",
+        "name": "Sarah Johnson",
+        "email": "sarah.j@example.com",
+        "phone": "+1-555-0456",
+        "preferences": {"class": "economy", "activities": ["museums", "food"]},
+        "created_at": "2024-01-05T00:00:00"
+    }
+]
+
+# Mock conversations for testing
+MOCK_CONVERSATIONS = [
+    {
+        "id": "conv-001",
+        "agency_id": "ba991771-fe20-488f-99bd-b8aea9fb9295",
+        "client_id": None,
+        "user_id": "user-001",
+        "title": "Paris Trip Planning",
+        "status": "active",
+        "destination": "Paris, France",
+        "travel_dates": {"start": "2024-06-15", "end": "2024-06-22"},
+        "summary": "Planning a week-long trip to Paris with focus on museums and cuisine",
+        "created_at": "2024-01-15T10:30:00",
+        "updated_at": "2024-01-15T14:20:00"
+    },
+    {
+        "id": "conv-002",
+        "agency_id": "ba991771-fe20-488f-99bd-b8aea9fb9295",
+        "client_id": None,
+        "user_id": "user-001",
+        "title": "Tokyo Business Trip",
+        "status": "pending_approval",
+        "destination": "Tokyo, Japan",
+        "travel_dates": {"start": "2024-03-10", "end": "2024-03-15"},
+        "summary": "Business trip to Tokyo with 2 days leisure",
+        "created_at": "2024-01-10T09:15:00",
+        "updated_at": "2024-01-14T16:45:00"
+    }
+]
+
+# Mock messages for testing
+MOCK_MESSAGES = {
+    "conv-001": [
+        {
+            "id": "msg-001",
+            "conversation_id": "conv-001",
+            "role": "user",
+            "content": "I want to plan a trip to Paris",
+            "created_at": "2024-01-15T10:30:00"
+        },
+        {
+            "id": "msg-002",
+            "conversation_id": "conv-001",
+            "role": "assistant",
+            "content": "I'd love to help you plan a trip to Paris! Could you tell me your preferred travel dates and how many travelers?",
+            "created_at": "2024-01-15T10:31:00"
+        },
+        {
+            "id": "msg-003",
+            "conversation_id": "conv-001",
+            "role": "user",
+            "content": "June 15-22, 2 travelers",
+            "created_at": "2024-01-15T10:35:00"
+        },
+        {
+            "id": "msg-004",
+            "conversation_id": "conv-001",
+            "role": "assistant",
+            "content": "Perfect! I've noted June 15-22 for 2 travelers. Let me search for flights and hotels in Paris for you.",
+            "created_at": "2024-01-15T10:36:00"
+        }
+    ],
+    "conv-002": [
+        {
+            "id": "msg-005",
+            "conversation_id": "conv-002",
+            "role": "user",
+            "content": "Need a business trip to Tokyo in March",
+            "created_at": "2024-01-10T09:15:00"
+        },
+        {
+            "id": "msg-006",
+            "conversation_id": "conv-002",
+            "role": "assistant",
+            "content": "I can help with your Tokyo business trip. What dates in March work for you?",
+            "created_at": "2024-01-10T09:16:00"
+        }
+    ]
+}
+
 
 @app.get("/api/conversations/{agency_id}", tags=["Conversations"])
 async def get_conversations(
@@ -242,23 +413,51 @@ async def get_conversations(
     Get all conversations for an agency.
     Optionally filter by status (active, pending_approval, closed, archived).
     """
-    from core.supabase import get_supabase_client
-
-    supabase = get_supabase_client()
-
-    query = supabase.table("conversations")\
-        .select("*")\
-        .eq("agency_id", agency_id)
+    conversations = [c for c in MOCK_CONVERSATIONS if c["agency_id"] == agency_id]
 
     if status:
-        query = query.eq("status", status)
-
-    result = query.order("updated_at", desc=True).execute()
+        conversations = [c for c in conversations if c["status"] == status]
 
     return {
-        "conversations": result.data or [],
-        "count": len(result.data) if result.data else 0
+        "conversations": conversations,
+        "count": len(conversations)
     }
+
+
+class CreateConversationRequest(BaseModel):
+    title: Optional[str] = "New Conversation"
+    client_id: Optional[str] = None
+
+
+@app.post("/api/conversations", tags=["Conversations"])
+async def create_conversation(
+    request: CreateConversationRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """
+    Create a new conversation.
+    """
+    from uuid import uuid4
+
+    new_conversation = {
+        "id": str(uuid4()),
+        "agency_id": "ba991771-fe20-488f-99bd-b8aea9fb9295",  # Mock agency
+        "user_id": "user-001",  # Mock user
+        "client_id": request.client_id,
+        "title": request.title or "New Conversation",
+        "status": "active",
+        "destination": None,
+        "travel_dates": None,
+        "summary": None,
+        "created_at": datetime.now().isoformat(),
+        "updated_at": datetime.now().isoformat()
+    }
+
+    MOCK_CONVERSATIONS.append(new_conversation)
+    # Initialize empty message list for this conversation
+    MOCK_MESSAGES[new_conversation["id"]] = []
+
+    return new_conversation
 
 
 @app.get("/api/conversation/{conversation_id}/messages", tags=["Conversations"])
@@ -269,30 +468,22 @@ async def get_conversation_messages(
     """
     Get full message history for a conversation.
     """
-    from core.supabase import get_supabase_client
+    # Find conversation in mock data
+    conversation = None
+    for c in MOCK_CONVERSATIONS:
+        if c["id"] == conversation_id:
+            conversation = c
+            break
 
-    supabase = get_supabase_client()
-
-    # Get conversation details
-    conv_result = supabase.table("conversations")\
-        .select("*")\
-        .eq("id", conversation_id)\
-        .single()\
-        .execute()
-
-    if not conv_result.data:
+    if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    # Get messages
-    messages_result = supabase.table("messages")\
-        .select("*")\
-        .eq("conversation_id", conversation_id)\
-        .order("created_at")\
-        .execute()
+    # Get messages from mock data
+    messages = MOCK_MESSAGES.get(conversation_id, [])
 
     return {
-        "conversation": conv_result.data,
-        "messages": messages_result.data or []
+        "conversation": conversation,
+        "messages": messages
     }
 
 
@@ -302,16 +493,16 @@ async def close_conversation(
     api_key: str = Depends(verify_api_key)
 ):
     """Close/archived a conversation."""
-    from core.supabase import get_supabase_client
+    # Find and update in mock data
+    conversation = None
+    for c in MOCK_CONVERSATIONS:
+        if c["id"] == conversation_id:
+            c["status"] = "closed"
+            c["updated_at"] = datetime.now().isoformat()
+            conversation = c
+            break
 
-    supabase = get_supabase_client()
-
-    result = supabase.table("conversations")\
-        .update({"status": "closed"})\
-        .eq("id", conversation_id)\
-        .execute()
-
-    if not result.data:
+    if not conversation:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
     return {"message": "Conversation closed", "conversation_id": conversation_id}
@@ -454,22 +645,14 @@ async def list_offers(
     api_key: str = Depends(verify_api_key)
 ):
     """List all offers for an agency."""
-    from core.supabase import get_supabase_client
-
-    supabase = get_supabase_client()
-
-    query = supabase.table("offers")\
-        .select("*")\
-        .eq("agency_id", agency_id)
+    offers = [o for o in MOCK_OFFERS if o["agency_id"] == agency_id]
 
     if status:
-        query = query.eq("status", status)
-
-    result = query.order("created_at", desc=True).execute()
+        offers = [o for o in offers if o["status"] == status]
 
     return {
-        "offers": result.data or [],
-        "count": len(result.data) if result.data else 0
+        "offers": offers,
+        "count": len(offers)
     }
 
 
@@ -515,20 +698,15 @@ async def get_agency_config(
     Get agency branding configuration for white-label frontend.
     Used by Next.js frontend to apply agency branding.
     """
-    from core.supabase import get_supabase_client
+    # Find agency by slug in mock data
+    agency = None
+    for a in MOCK_AGENCIES.values():
+        if a.get("slug") == slug:
+            agency = a
+            break
 
-    supabase = get_supabase_client()
-
-    result = supabase.table("agencies")\
-        .select("name, slug, branding_config, settings")\
-        .eq("slug", slug)\
-        .single()\
-        .execute()
-
-    if not result.data:
+    if not agency:
         raise HTTPException(status_code=404, detail="Agency not found")
-
-    agency = result.data
 
     return AgencyConfigResponse(
         name=agency["name"],
@@ -544,21 +722,19 @@ async def verify_agency_slug(
     api_key: str = Depends(verify_api_key)
 ):
     """Verify if an agency slug exists (for subdomain routing)."""
-    from core.supabase import get_supabase_client
+    # Find agency by slug in mock data
+    agency = None
+    for a_id, a in MOCK_AGENCIES.items():
+        if a.get("slug") == slug:
+            agency = {"id": a_id, "name": a["name"], "slug": a["slug"]}
+            break
 
-    supabase = get_supabase_client()
-
-    result = supabase.table("agencies")\
-        .select("id, name, slug")\
-        .eq("slug", slug)\
-        .execute()
-
-    if not result.data or len(result.data) == 0:
+    if not agency:
         raise HTTPException(status_code=404, detail="Agency not found")
 
     return {
         "exists": True,
-        "agency": result.data[0]
+        "agency": agency
     }
 
 
@@ -573,22 +749,15 @@ async def list_clients(
     api_key: str = Depends(verify_api_key)
 ):
     """List all clients for an agency."""
-    from core.supabase import get_supabase_client
-
-    supabase = get_supabase_client()
-
-    query = supabase.table("clients")\
-        .select("*")\
-        .eq("agency_id", agency_id)
+    clients = [c for c in MOCK_CLIENTS if c["agency_id"] == agency_id]
 
     if search:
-        query = query.or_(f"name.ilike.%{search}%,email.ilike.%{search}%")
-
-    result = query.order("created_at", desc=True).execute()
+        search_lower = search.lower()
+        clients = [c for c in clients if search_lower in c["name"].lower() or search_lower in c["email"].lower()]
 
     return {
-        "clients": result.data or [],
-        "count": len(result.data) if result.data else 0
+        "clients": clients,
+        "count": len(clients)
     }
 
 

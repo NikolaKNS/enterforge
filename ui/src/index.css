@@ -1,8 +1,8 @@
-@import "tailwindcss";
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
-@custom-variant dark (&:where(.dark, .dark *));
-
-@theme {
+:root {
   --color-accent: #7cb87c;
   --color-accent-bg: rgba(124, 184, 124, 0.1);
   --color-sidebar: #1a1a1a;
