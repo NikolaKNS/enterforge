@@ -1,0 +1,24 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-accent: #7cb87c;
+  --color-accent-bg: rgba(124, 184, 124, 0.1);
+  --color-sidebar: #1a1a1a;
+  --color-sidebar-text: #ffffff;
+  --color-sidebar-muted: #9ca3af;
+  --color-nav-active: #7cb87c;
+}
+
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  width: 100%;
+  min-height: 100vh;
+}
